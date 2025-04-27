@@ -1,0 +1,736 @@
+Prepare a spec for below
+FORM get_data .
+  SELECT  v~vbeln v~fkart v~waerk v~vkorg v~vtweg v~fkdat v~netwr
+          v~kunag v~xblnr v~mwsbk
+          p~posnr p~netwr p~aubel p~aupos p~erdat p~mwsbp p~zzwn_invoice
+          p~zzweek_end
+          FROM vbrk AS v JOIN vbrp AS p ON p~vbeln = v~vbeln
+          INTO TABLE gt_vbrk
+          WHERE v~vbeln IN s_vbeln
+          AND v~fkart IN s_fkart
+          AND v~fkdat IN s_fkdat
+          AND v~kunag IN s_kunag
+          AND v~vkorg IN s_vkorg.
+
+  IF gt_vbrk IS INITIAL.
+    MESSAGE s000(zsd1) WITH 'No data found'.
+    EXIT.
+  ENDIF.
+
+  SELECT vbeln posnr parvw lifnr pernr
+    FROM vbpa INTO TABLE gt_vbpa FOR ALL ENTRIES IN gt_vbrk
+         WHERE vbeln = gt_vbrk-aubel
+           AND ( parvw = 'ZV' OR parvw = 'Z3' ).
+
+  SELECT lifnr name1 pstlz FROM lfa1 INTO TABLE gt_lfa1
+    FOR ALL ENTRIES IN gt_vbpa
+         WHERE lifnr = gt_vbpa-lifnr.
+
+  SELECT pernr nachn vorna FROM pa0002 INTO TABLE gt_pernr
+    FOR ALL ENTRIES IN gt_vbpa
+         WHERE pernr  = gt_vbpa-pernr.
+
+  SELECT vbeln posnr matnr arktx pstyv vgbel cuobj
+         zzwn_invoice zzwn_vbeln zzweek_end
+         FROM vbap INTO CORRESPONDING FIELDS OF TABLE gt_vbap
+         FOR ALL ENTRIES IN gt_vbrk
+             WHERE vbeln = gt_vbrk-aubel
+             AND ( posnr = gt_vbrk-aupos OR posnr = 000010 ).
+
+  CLEAR wa_vbap.
+  LOOP AT gt_vbap INTO wa_vbap.
+    IF wa_vbap-pstyv EQ 'ZCRL' OR wa_vbap-pstyv EQ 'ZCRE'.
+*   Separate the credit lines to processed differently.
+      APPEND wa_vbap TO gt_vbap1.
+    ENDIF.
+    UNPACK wa_vbap-cuobj TO wa_cuobj-cuobj.
+    APPEND wa_cuobj TO lt_cuobj.
+    CLEAR wa_cuobj.
+  ENDLOOP.
+
+* Get the original document data for the credit memos to get
+* the configuration details/custom fields
+
+  IF gt_vbap1 IS NOT INITIAL.
+    SELECT v~vbeln v~fkart v~fkdat v~kunag v~xblnr
+           p~posnr p~netwr p~aubel p~aupos p~mwsbp
+    FROM vbrk AS v JOIN vbrp AS p ON p~vbeln = v~vbeln
+    INTO TABLE gt_vbrk1 FOR ALL ENTRIES IN gt_vbap1
+    WHERE v~vbeln = gt_vbap1-vgbel
+      AND p~posnr = gt_vbap1-posnr.
+
+    REFRESH gt_vbap1.
+    SELECT vbeln posnr matnr arktx pstyv vgbel cuobj
+           zzwn_invoice zzwn_vbeln zzweek_end
+    FROM vbap INTO CORRESPONDING FIELDS OF TABLE gt_vbap1
+    FOR ALL ENTRIES IN gt_vbrk1
+         WHERE vbeln = gt_vbrk1-aubel
+           AND posnr = 000010.
+
+    LOOP AT gt_vbap1 INTO wa_vbap.
+      UNPACK wa_vbap-cuobj TO wa_cuobj-cuobj.
+      APPEND wa_cuobj TO lt_cuobj.
+      CLEAR wa_cuobj.
+    ENDLOOP.
+  ENDIF.
+
+  CREATE OBJECT lo_config
+    EXPORTING
+      pt_cuobj = lt_cuobj.
+
+  IF lo_config IS BOUND.
+    CALL METHOD lo_config->get_characteristics
+      IMPORTING
+        pt_chars = lt_chars.
+  ENDIF.
+
+  DELETE lt_chars WHERE atwrt IS INITIAL AND netwr IS INITIAL.
+
+* Get the details
+  SELECT * FROM zsd_quest_det INTO TABLE gt_quest_detail
+  FOR ALL ENTRIES IN gt_vbrk
+  WHERE wn_invoice = gt_vbrk-zzwn_invoice.
+  IF gt_quest_detail IS NOT INITIAL.
+    SORT gt_quest_detail BY erdat
+                            bukrs
+                            wn_invoice
+                            wn_order
+                            pernr
+                            week_endda
+                            contractor
+                            proj_id.
+
+  ENDIF.
+
+ENDFORM.      
+
+
+FORM process_data .
+*DO 1020 TIMES.
+*  CONCATENATE lv_filler SPACE into lv_filler RESPECTING BLANKS.
+*ENDDO.
+
+* Fill record 998 details(File Header data). it helps in processing
+* the record at customer side.
+  CLEAR lv_string.
+  CLEAR wa_file.
+  PERFORM fill_998.
+
+* Fill Invoice details.
+
+  CLEAR wa_output.
+  CLEAR wa_csv_output.
+  CLEAR wa_quest_detail.
+  CLEAR lv_det.
+  CLEAR lv_count.
+  CLEAR lv_vbeln_prev.
+  CLEAR lv_inv_count.
+
+
+  LOOP AT gt_vbrk INTO wa_vbrk.
+    IF lv_vbeln_prev NE wa_vbrk-vbeln.
+      CLEAR lv_count.
+      lv_count = lv_count + 1.
+      lv_inv_count = lv_inv_count + 1.
+      lv_vbeln_prev = wa_vbrk-vbeln.
+    ELSE.
+      lv_count = lv_count + 1.
+    ENDIF.
+
+*---Start of record 000---*
+
+    PERFORM fill_000_defaults.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = wa_vbrk-vbeln
+      IMPORTING
+        output = wa_csv_output-f11.
+
+    wa_csv_output-f12 = wa_vbrk-fkdat.
+    wa_csv_output-f35 = wa_vbrk-waerk.  "'USD'.  " Invoice Currency
+
+*   Get all Total.
+    IF wa_vbrk-fkart EQ 'ZCRL' OR wa_vbrk-fkart EQ 'ZCRE'.
+      lv_inv_total = lv_inv_total + ( wa_vbrk-netwk * -1 )
+                      + ( wa_vbrk-mwsbk * -1 ).
+    ELSE.
+      lv_inv_total = lv_inv_total + wa_vbrk-netwk + wa_vbrk-mwsbk.
+    ENDIF.
+
+    wa_vbrk-netwk = wa_vbrk-netwk * 100.
+    wa_vbrk-mwsbk = wa_vbrk-mwsbk * 100.
+    wa_vbrk-netwk = wa_vbrk-netwk + wa_vbrk-mwsbk.
+
+    MOVE wa_vbrk-netwk TO wa_csv_output-f25.
+    "  ref:    wa_csv_output-f25 = '0000000000050075'.
+    MOVE wa_vbrk-mwsbk TO wa_csv_output-f28.
+*   ref: output is same type as gross amount i.e wa_csv_output-f25
+
+*   get the detail record.
+    CLEAR wa_quest_detail.
+    CLEAR lv_det.
+    READ TABLE gt_quest_detail INTO wa_quest_detail
+               WITH KEY wn_invoice = wa_vbrk-zzwn_invoice.
+    IF sy-subrc = 0.
+      lv_det = 'X'.
+    ENDIF.
+
+*   find the config details for this invoice or credit.
+    CLEAR wa_vbap.
+    READ TABLE gt_vbap INTO wa_vbap WITH KEY vbeln = wa_vbrk-aubel
+                                           posnr = wa_vbrk-aupos.
+    IF sy-subrc = 0.
+      IF wa_vbrk-fkart EQ 'ZCRL' OR wa_vbrk-fkart EQ 'ZCRE'.
+        CLEAR wa_vbrk1.
+        READ TABLE gt_vbrk1 INTO wa_vbrk1
+                   WITH KEY vbeln = wa_vbrk-xblnr.
+        IF sy-subrc = 0.
+          READ TABLE gt_vbap1 INTO wa_vbap
+                   WITH KEY vbeln = wa_vbrk1-aubel
+                            posnr = 000010.
+          IF sy-subrc = 0.
+            LOOP AT lt_chars INTO wa_chars WHERE cuobj = wa_vbap-cuobj.
+              CASE wa_chars-atnam.
+                WHEN 'CUST_COST_CENTER'.
+                  wa_output-site_code = wa_chars-atwrt.
+                WHEN 'CUST_GL_CODE'.
+                  wa_output-glbu = wa_chars-atwrt.
+                WHEN 'CUST_BUSINESS_UNIT'.
+                  wa_output-rbu = wa_chars-atwrt.
+                WHEN 'CUST_ACCT_NUMBER'.
+                  wa_output-account = wa_chars-atwrt.
+                WHEN 'CUST_DIV_UNIT_NUMBER'.
+                  wa_output-apbu = wa_chars-atwrt.
+                WHEN 'CUST_DEPT_NUMBER'.
+                  wa_output-dept = wa_chars-atwrt.
+                WHEN 'CUST_VENDOR_NUMBER'.
+                  wa_output-set_id = wa_chars-atwrt.
+                WHEN 'CUST_BUDGET_CENTER'.
+                  wa_output-lob = wa_chars-atwrt.
+                WHEN 'CUST_GL_CODE'.
+                  wa_output-bu = wa_chars-atwrt.
+                WHEN 'CUST_COMPANY_CODE'.
+                  wa_output-pcbu = wa_chars-atwrt.
+                WHEN 'CUST_FEPS_CODE'.
+                  wa_output-activity = wa_chars-atwrt.
+                WHEN 'CUST_TASK15'.
+                  wa_output-antype = wa_chars-atwrt.
+                WHEN 'CUST_ORG_CODE'.
+                  wa_output-source_type = wa_chars-atwrt.
+                WHEN 'CUST_PROJECT_NUMBER'.
+                  wa_output-proj_id = wa_chars-atwrt.
+                WHEN 'CUST_DOTS_NUMBER'.
+                  wa_output-dot = wa_chars-atwrt.
+              ENDCASE.
+            ENDLOOP.
+            IF wa_vbrk-vtweg = 'SC'.
+              READ TABLE gt_vbap1 INTO wa_vbap
+                                 WITH KEY vbeln = wa_vbrk1-aubel
+                                          posnr = wa_vbrk1-aupos.
+              IF sy-subrc = 0.
+                READ TABLE lt_chars INTO wa_chars
+                                    WITH KEY cuobj = wa_vbap-cuobj
+                                             atnam = 'CUST_DOTS_NUMBER'.
+                IF sy-subrc = 0.
+                  wa_output-dot = wa_chars-atwrt.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        IF wa_vbrk-netwk GT 0.
+          REPLACE wa_csv_output-f25+0(1) IN wa_csv_output-f25 WITH '-'.
+        ENDIF.
+        IF wa_vbrk-mwsbk GT 0.
+          REPLACE wa_csv_output-f28+0(1) IN wa_csv_output-f28 WITH '-'.
+        ENDIF.
+
+      ELSE.
+        READ TABLE gt_vbap INTO wa_vbap WITH KEY vbeln = wa_vbrk-aubel
+                                                 posnr = 000010.
+        IF sy-subrc = 0.
+          LOOP AT lt_chars INTO wa_chars WHERE cuobj = wa_vbap-cuobj.
+            CASE wa_chars-atnam.
+              WHEN 'CUST_COST_CENTER'.
+                wa_output-site_code = wa_chars-atwrt.
+              WHEN 'CUST_GL_CODE'.
+                wa_output-glbu = wa_chars-atwrt.
+              WHEN 'CUST_BUSINESS_UNIT'.
+                wa_output-rbu = wa_chars-atwrt.
+              WHEN 'CUST_ACCT_NUMBER'.
+                wa_output-account = wa_chars-atwrt.
+              WHEN 'CUST_DIV_UNIT_NUMBER'.
+                wa_output-apbu = wa_chars-atwrt.
+              WHEN 'CUST_DEPT_NUMBER'.
+                wa_output-dept = wa_chars-atwrt.
+              WHEN 'CUST_VENDOR_NUMBER'.
+                wa_output-set_id = wa_chars-atwrt.
+              WHEN 'CUST_BUDGET_CENTER'.
+                wa_output-lob = wa_chars-atwrt.
+              WHEN 'CUST_GL_CODE'.
+                wa_output-bu = wa_chars-atwrt.
+              WHEN 'CUST_COMPANY_CODE'.
+                wa_output-pcbu = wa_chars-atwrt.
+              WHEN 'CUST_FEPS_CODE'.
+                wa_output-activity = wa_chars-atwrt.
+              WHEN 'CUST_TASK15'.
+                wa_output-antype = wa_chars-atwrt.
+              WHEN 'CUST_ORG_CODE'.
+                wa_output-source_type = wa_chars-atwrt.
+              WHEN 'CUST_PROJECT_NUMBER'.
+                wa_output-proj_id = wa_chars-atwrt.
+              WHEN 'CUST_DOTS_NUMBER'.
+                wa_output-dot = wa_chars-atwrt.
+            ENDCASE.
+          ENDLOOP.
+          IF wa_vbrk-vtweg = 'SC'.
+            READ TABLE gt_vbap INTO wa_vbap
+                               WITH KEY vbeln = wa_vbrk-aubel
+                                        posnr = wa_vbrk-aupos.
+            IF sy-subrc = 0.
+              READ TABLE lt_chars INTO wa_chars
+                                  WITH KEY cuobj = wa_vbap-cuobj
+                                           atnam = 'CUST_DOTS_NUMBER'.
+              IF sy-subrc = 0.
+                wa_output-dot = wa_chars-atwrt.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    IF lv_det = 'X'. "if the details exist
+
+      CLEAR lv_proj_id.
+      CLEAR lv_total.
+      REFRESH gt_quest_detail2.
+      LOOP AT gt_quest_detail INTO wa_quest_detail
+                              WHERE wn_invoice = wa_vbrk-zzwn_invoice.
+        APPEND wa_quest_detail TO gt_quest_detail2.
+      ENDLOOP.
+
+      CLEAR wa_quest_detail.
+      REFRESH gt_quest_det_tmp.
+      REFRESH gt_quest_tmp.
+      CLEAR wa_quest_det_tmp.
+      SORT gt_quest_detail BY erdat
+                              bukrs
+                              wn_invoice
+                              wn_order
+                              pernr
+                              week_endda
+                              contractor
+                              proj_id
+                              glbu
+                              rbu
+                              dept
+                              site_code
+                              lob
+                              account
+                              pcbu
+                              activity
+                              source_type
+                              antype
+                              apbu
+                              set_id.
+      SORT gt_quest_detail2 BY
+                             erdat
+                             bukrs
+                             wn_invoice
+                             wn_order
+                             pernr
+                             week_endda
+                             contractor.
+
+      LOOP AT gt_quest_detail2 INTO wa_quest_detail.
+        wa_quest_tmp-erdat = wa_quest_detail-erdat.
+        wa_quest_tmp-bukrs = wa_quest_detail-bukrs.
+        wa_quest_tmp-wn_invoice = wa_quest_detail-wn_invoice.
+        wa_quest_tmp-wn_order = wa_quest_detail-wn_order.
+        wa_quest_tmp-pernr = wa_quest_detail-pernr.
+        wa_quest_tmp-week_endda = wa_quest_detail-week_endda.
+        wa_quest_tmp-contractor = wa_quest_detail-contractor.
+        wa_quest_tmp-proj_id = wa_quest_detail-proj_id.
+        wa_quest_tmp-glbu = wa_quest_detail-glbu.
+        wa_quest_tmp-rbu = wa_quest_detail-rbu.
+        wa_quest_tmp-dept = wa_quest_detail-dept.
+        wa_quest_tmp-site_code = wa_quest_detail-site_code.
+        wa_quest_tmp-lob = wa_quest_detail-lob.
+        wa_quest_tmp-account = wa_quest_detail-account.
+        wa_quest_tmp-pcbu = wa_quest_detail-pcbu.
+        wa_quest_tmp-activity = wa_quest_detail-activity.
+        wa_quest_tmp-source_type = wa_quest_detail-source_type.
+        wa_quest_tmp-antype = wa_quest_detail-antype.
+        wa_quest_tmp-apbu = wa_quest_detail-apbu.
+        wa_quest_tmp-set_id = wa_quest_detail-set_id.
+        wa_quest_tmp-shift = wa_quest_detail-shift.
+        wa_quest_tmp-pay_type = wa_quest_detail-pay_type.
+        wa_quest_tmp-cus_bill_rate = wa_quest_detail-cus_bill_rate.
+        wa_quest_tmp-zhours = wa_quest_detail-zhours.
+        wa_quest_tmp-total = wa_quest_detail-total.
+
+        COLLECT wa_quest_tmp INTO gt_quest_tmp.
+        CLEAR: wa_quest_tmp, wa_quest_detail,lv_total.
+      ENDLOOP.
+
+      CLEAR: wa_quest_tmp.
+      LOOP AT gt_quest_tmp INTO wa_quest_tmp.
+        MOVE-CORRESPONDING wa_quest_tmp to wa_quest_det_tmp.
+        APPEND wa_quest_det_tmp to gt_quest_det_tmp.
+        CLEAR: wa_quest_tmp,wa_quest_det_tmp.
+      ENDLOOP.
+
+****----------- Begin of code comments by Tiru for making rows 4 from 10 rows.
+**      LOOP AT gt_quest_detail2 INTO wa_quest_detail.
+**
+**        IF  wa_quest_det_tmp-erdat = wa_quest_detail-erdat AND
+**            wa_quest_det_tmp-bukrs = wa_quest_detail-bukrs AND
+**            wa_quest_det_tmp-wn_invoice = wa_quest_detail-wn_invoice AND
+**            wa_quest_det_tmp-wn_order = wa_quest_detail-wn_order AND
+**            wa_quest_det_tmp-pernr = wa_quest_detail-pernr AND
+**            wa_quest_det_tmp-week_endda = wa_quest_detail-week_endda AND
+**            wa_quest_det_tmp-contractor = wa_quest_detail-contractor AND
+**            wa_quest_det_tmp-proj_id = wa_quest_detail-proj_id AND
+**            wa_quest_det_tmp-glbu = wa_quest_detail-glbu AND
+**            wa_quest_det_tmp-rbu = wa_quest_detail-rbu AND
+**            wa_quest_det_tmp-dept = wa_quest_detail-dept AND
+**            wa_quest_det_tmp-site_code = wa_quest_detail-site_code AND
+**            wa_quest_det_tmp-lob = wa_quest_detail-lob AND
+**            wa_quest_det_tmp-account = wa_quest_detail-account AND
+**            wa_quest_det_tmp-pcbu = wa_quest_detail-pcbu AND
+**            wa_quest_det_tmp-activity = wa_quest_detail-activity AND
+**            wa_quest_det_tmp-source_type = wa_quest_detail-source_type
+**       AND  wa_quest_det_tmp-antype = wa_quest_detail-antype AND
+**            wa_quest_det_tmp-apbu = wa_quest_detail-apbu AND
+**            wa_quest_det_tmp-set_id = wa_quest_detail-set_id.
+**          lv_total = lv_total + wa_quest_detail-total.
+**        ELSE.
+**
+**          IF wa_quest_det_tmp-erdat IS INITIAL AND
+**              wa_quest_det_tmp-bukrs IS INITIAL AND
+**              wa_quest_det_tmp-wn_invoice IS INITIAL AND
+**              wa_quest_det_tmp-wn_order IS INITIAL AND
+**              wa_quest_det_tmp-pernr IS INITIAL AND
+**              wa_quest_det_tmp-week_endda IS INITIAL AND
+**              wa_quest_det_tmp-sno IS INITIAL AND
+**              wa_quest_det_tmp-contractor IS INITIAL AND
+**              wa_quest_det_tmp-proj_id IS INITIAL AND
+**              wa_quest_det_tmp-glbu IS INITIAL AND
+**              wa_quest_det_tmp-rbu IS INITIAL AND
+**              wa_quest_det_tmp-dept IS INITIAL AND
+**              wa_quest_det_tmp-site_code IS INITIAL AND
+**              wa_quest_det_tmp-lob IS INITIAL AND
+**              wa_quest_det_tmp-account IS INITIAL AND
+**              wa_quest_det_tmp-pcbu IS INITIAL AND
+**              wa_quest_det_tmp-activity IS INITIAL AND
+**              wa_quest_det_tmp-source_type IS INITIAL AND
+**              wa_quest_det_tmp-antype IS INITIAL AND
+**              wa_quest_det_tmp-apbu IS INITIAL AND
+**              wa_quest_det_tmp-set_id IS INITIAL.
+**
+**            wa_quest_det_tmp-erdat = wa_quest_detail-erdat.
+**            wa_quest_det_tmp-bukrs = wa_quest_detail-bukrs.
+**            wa_quest_det_tmp-wn_invoice = wa_quest_detail-wn_invoice.
+**            wa_quest_det_tmp-wn_order = wa_quest_detail-wn_order.
+**            wa_quest_det_tmp-pernr = wa_quest_detail-pernr.
+**            wa_quest_det_tmp-week_endda = wa_quest_detail-week_endda.
+**            wa_quest_det_tmp-contractor = wa_quest_detail-contractor.
+**            wa_quest_det_tmp-proj_id = wa_quest_detail-proj_id.
+**            wa_quest_det_tmp-glbu = wa_quest_detail-glbu.
+**            wa_quest_det_tmp-rbu = wa_quest_detail-rbu.
+**            wa_quest_det_tmp-dept = wa_quest_detail-dept.
+**            wa_quest_det_tmp-site_code = wa_quest_detail-site_code.
+**            wa_quest_det_tmp-lob = wa_quest_detail-lob.
+**            wa_quest_det_tmp-account = wa_quest_detail-account.
+**            wa_quest_det_tmp-pcbu = wa_quest_detail-pcbu.
+**            wa_quest_det_tmp-activity = wa_quest_detail-activity.
+**            wa_quest_det_tmp-source_type = wa_quest_detail-source_type.
+**            wa_quest_det_tmp-antype = wa_quest_detail-antype.
+**            wa_quest_det_tmp-apbu = wa_quest_detail-apbu.
+**            wa_quest_det_tmp-set_id = wa_quest_detail-set_id.
+**
+**            lv_total = lv_total + wa_quest_detail-total.
+**            MOVE wa_quest_detail TO wa_quest_detail2.
+**          ELSE.
+****------------------------------
+**
+****------------------------------
+**            wa_quest_detail2-total = lv_total.
+**            APPEND wa_quest_detail2 TO gt_quest_det_tmp.
+**            CLEAR lv_total.
+**            CLEAR lv_proj_id.
+**            CLEAR wa_quest_detail2.
+**            CLEAR wa_quest_det_tmp.
+**            MOVE wa_quest_detail TO wa_quest_detail2.
+**            wa_quest_det_tmp-erdat = wa_quest_detail-erdat.
+**            wa_quest_det_tmp-bukrs = wa_quest_detail-bukrs.
+**            wa_quest_det_tmp-wn_invoice = wa_quest_detail-wn_invoice.
+**            wa_quest_det_tmp-wn_order = wa_quest_detail-wn_order.
+**            wa_quest_det_tmp-pernr = wa_quest_detail-pernr.
+**            wa_quest_det_tmp-week_endda = wa_quest_detail-week_endda.
+**            wa_quest_det_tmp-contractor = wa_quest_detail-contractor.
+**            wa_quest_det_tmp-proj_id = wa_quest_detail-proj_id.
+**            wa_quest_det_tmp-glbu = wa_quest_detail-glbu.
+**            wa_quest_det_tmp-rbu = wa_quest_detail-rbu.
+**            wa_quest_det_tmp-dept = wa_quest_detail-dept.
+**            wa_quest_det_tmp-site_code = wa_quest_detail-site_code.
+**            wa_quest_det_tmp-lob = wa_quest_detail-lob.
+**            wa_quest_det_tmp-account = wa_quest_detail-account.
+**            wa_quest_det_tmp-pcbu = wa_quest_detail-pcbu.
+**            wa_quest_det_tmp-activity = wa_quest_detail-activity.
+**            wa_quest_det_tmp-source_type = wa_quest_detail-source_type.
+**            wa_quest_det_tmp-antype = wa_quest_detail-antype.
+**            wa_quest_det_tmp-apbu = wa_quest_detail-apbu.
+**            wa_quest_det_tmp-set_id = wa_quest_detail-set_id.
+**            lv_total = lv_total + wa_quest_detail-total.
+**          ENDIF.
+**        ENDIF.
+**        AT LAST.
+**          wa_quest_detail2-total = lv_total.
+**          APPEND wa_quest_detail2 TO gt_quest_det_tmp.
+**          CLEAR lv_total.
+**          CLEAR lv_proj_id.
+**          CLEAR wa_quest_detail2.
+**        ENDAT.
+**      ENDLOOP.
+****----------- ENd of code comments by Tiru for making rows 4 from 10 rows.
+      READ TABLE gt_quest_det_tmp INTO wa_quest_det_tmp INDEX 1.
+      IF sy-subrc eq 0.
+        wa_csv_output-f9   = wa_quest_det_tmp-apbu.
+        wa_csv_output-f13  = wa_quest_det_tmp-set_id.
+        CLEAR : wa_quest_det_tmp.
+      ENDIF.
+*      wa_csv_output-f147 = wa_quest_detail-glbu.
+*      wa_csv_output-f148 = wa_quest_detail-account.
+*      wa_csv_output-f161 = wa_quest_detail-pcbu.
+*      wa_csv_output-f162 = wa_quest_detail-activity.
+*      wa_csv_output-f163 = wa_quest_detail-antype.
+*      wa_csv_output-f164 = wa_quest_detail-source_type.
+*      wa_csv_output-f182 = wa_quest_detail-dept.
+*      wa_csv_output-f184 = wa_quest_detail-proj_id.
+*      wa_csv_output-f187 = wa_quest_detail-glbu.
+*      wa_csv_output-f188 = wa_quest_detail-site_code.
+*      wa_csv_output-f189 = wa_quest_detail-rbu.
+*      wa_csv_output-f190 = wa_quest_detail-lob.
+    ELSE. " get the above details from Config
+      wa_csv_output-f9   = wa_output-apbu.
+      wa_csv_output-f13  = wa_output-set_id.
+      wa_csv_output-f147 = wa_output-glbu.
+      wa_csv_output-f148 = wa_output-account.
+      wa_csv_output-f161 = wa_output-pcbu.
+      wa_csv_output-f162 = wa_output-activity.
+      wa_csv_output-f163 = wa_output-antype. "derieved from-
+*     -capex string
+      wa_csv_output-f164 = wa_output-source_type.
+      wa_csv_output-f182 = wa_output-dept.
+      wa_csv_output-f184 = wa_output-proj_id.
+      wa_csv_output-f187 = wa_output-glbu.
+      wa_csv_output-f188 = wa_output-site_code.
+      wa_csv_output-f189 = wa_output-rbu.
+      wa_csv_output-f190 = wa_output-lob.
+    ENDIF.
+
+    CONCATENATE wa_output-dot '-' wa_vbrk-zzweek_end '-'
+    wa_vbrk-zzwn_invoice INTO wa_csv_output-f82.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_csv_output-f82
+      IMPORTING
+        output = wa_csv_output-f82.
+
+    PERFORM append_000.
+
+    IF lv_det = 'X'.
+      CLEAR lv_count2.
+      LOOP AT gt_quest_det_tmp INTO wa_quest_detail2.
+        lv_count2 = lv_count2 + 1.
+*----Start of record 001 ----*z
+*     Fill details for each detail project Line.
+        wa_csv_output-f94  = wa_quest_detail2-apbu.
+        wa_csv_output-f147 = wa_quest_detail2-glbu.
+        wa_csv_output-f148 = wa_quest_detail2-account.
+        wa_csv_output-f161 = wa_quest_detail2-pcbu.
+        wa_csv_output-f162 = wa_quest_detail2-activity.
+        wa_csv_output-f163 = wa_quest_detail2-antype.
+        wa_csv_output-f164 = wa_quest_detail2-source_type.
+        wa_csv_output-f182 = wa_quest_detail2-dept.
+        wa_csv_output-f184 = wa_quest_detail2-proj_id.
+        wa_csv_output-f187 = wa_quest_detail2-glbu.
+        wa_csv_output-f188 = wa_quest_detail2-site_code.
+        wa_csv_output-f189 = wa_quest_detail2-rbu.
+        wa_csv_output-f190 = wa_quest_detail2-lob.
+
+        PERFORM fill_001_defaults.
+
+        wa_csv_output-f96 = lv_count2. " '00001'.Voucher line item
+
+        CLEAR wa_vbpa.
+        READ TABLE gt_vbpa INTO wa_vbpa WITH KEY vbeln = wa_vbrk-aubel
+                                                 parvw = 'ZV'.
+        IF sy-subrc = 0.
+          CLEAR wa_lfa1.
+          READ TABLE gt_lfa1 INTO wa_lfa1 WITH KEY lifnr = wa_vbpa-lifnr.
+        ENDIF.
+        CLEAR wa_vbpa.
+        READ TABLE gt_vbpa INTO wa_vbpa WITH KEY vbeln = wa_vbrk-aubel
+*                                               posnr = wa_vbrk-posnr
+                                                 parvw = 'Z3'.
+        IF sy-subrc = 0.
+          CLEAR wa_pernr.
+          READ TABLE gt_pernr INTO wa_pernr WITH KEY pernr = wa_vbpa-pernr.
+        ENDIF.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = wa_pernr-nachn
+          IMPORTING
+            output = wa_pernr-nachn.
+        IF wa_vbrk-vtweg = 'SC'.
+          CONCATENATE wa_lfa1-name1+0(15) '-' 'SOW           '
+          INTO wa_csv_output-f102
+          RESPECTING BLANKS.  " Description
+        ELSE.
+          CONCATENATE wa_lfa1-name1+0(15) '-' wa_pernr-nachn+0(12)
+          ',' wa_pernr-vorna+0(1) INTO wa_csv_output-f102
+          RESPECTING BLANKS.  " Description
+        ENDIF.
+*        wa_vbrk-netwr = wa_vbrk-netwr * 100.
+*        wa_vbrk-mwsbp = wa_vbrk-mwsbp * 100.
+*        MOVE wa_vbrk-netwr TO wa_csv_output-f103.
+        wa_quest_detail2-total = wa_quest_detail2-total * 100.
+        MOVE wa_quest_detail2-total TO wa_csv_output-f103.
+        IF wa_vbrk-fkart EQ 'ZCRL' OR wa_vbrk-fkart EQ 'ZCRE'.
+          IF wa_csv_output-f103 GT 0.
+            REPLACE wa_csv_output-f103+0(1) IN wa_csv_output-f103
+            WITH '-'.
+          ENDIF.
+        ENDIF.
+
+        wa_csv_output-f123 = wa_vbrk-waerk. "'USD'. " Hardcoded
+        wa_csv_output-f124 = wa_vbrk-waerk. "'USD'. " Hardcoded
+        wa_csv_output-f125 = wa_vbrk-waerk. "'USD'. " Hardcoded
+
+        IF wa_vbrk-mwsbp IS INITIAL.
+          wa_csv_output-f131 = 'U'.
+        ELSE.
+          wa_csv_output-f131 = 'S'.
+        ENDIF.                      "if tax, then s, else U.
+
+        PERFORM append_001.
+
+*--Start of record 002----*
+
+        PERFORM fill_002_defaults.
+
+        wa_csv_output-f143 = wa_csv_output-f94.  "'001TR'.
+        wa_csv_output-f145 = wa_csv_output-f96.             " '00001'.
+
+        MOVE wa_csv_output-f102 TO wa_csv_output-f154. " from record 001
+        wa_csv_output-f155 = wa_csv_output-f103.  " '00000000000000500'.
+
+        PERFORM append_002.
+
+      ENDLOOP.
+
+    ELSE.
+*----Start of record 001 ----*
+
+      PERFORM fill_001_defaults.
+
+      wa_csv_output-f94 = wa_csv_output-f9.
+      wa_csv_output-f96 = lv_count. " '00001'.Voucher line item
+
+      CLEAR wa_vbpa.
+      READ TABLE gt_vbpa INTO wa_vbpa WITH KEY vbeln = wa_vbrk-aubel
+                                               parvw = 'ZV'.
+      IF sy-subrc = 0.
+        CLEAR wa_lfa1.
+        READ TABLE gt_lfa1 INTO wa_lfa1 WITH KEY lifnr = wa_vbpa-lifnr.
+      ENDIF.
+      CLEAR wa_vbpa.
+      READ TABLE gt_vbpa INTO wa_vbpa WITH KEY vbeln = wa_vbrk-aubel
+*                                               posnr = wa_vbrk-posnr
+                                               parvw = 'Z3'.
+      IF sy-subrc = 0.
+        CLEAR wa_pernr.
+        READ TABLE gt_pernr INTO wa_pernr WITH KEY pernr = wa_vbpa-pernr.
+      ENDIF.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = wa_pernr-nachn
+        IMPORTING
+          output = wa_pernr-nachn.
+
+      IF wa_vbrk-vtweg = 'SC'.
+        CONCATENATE wa_lfa1-name1+0(15) '-' 'SOW           '
+        INTO wa_csv_output-f102
+        RESPECTING BLANKS.  " Description
+      ELSE.
+        CONCATENATE wa_lfa1-name1+0(15) '-' wa_pernr-nachn+0(12)
+        ',' wa_pernr-vorna+0(1) INTO wa_csv_output-f102
+        RESPECTING BLANKS.  " Description
+      ENDIF.
+
+      wa_vbrk-netwr = wa_vbrk-netwr * 100.
+      wa_vbrk-mwsbp = wa_vbrk-mwsbp * 100.
+      MOVE wa_vbrk-netwr TO wa_csv_output-f103.
+      IF wa_vbrk-fkart EQ 'ZCRL' OR wa_vbrk-fkart EQ 'ZCRE'.
+        IF wa_csv_output-f103 GT 0.
+          REPLACE wa_csv_output-f103+0(1) IN wa_csv_output-f103
+          WITH '-'.
+        ENDIF.
+      ENDIF.
+
+      wa_csv_output-f123 = wa_vbrk-waerk. "'USD'. " Hardcoded
+      wa_csv_output-f124 = wa_vbrk-waerk. "'USD'. " Hardcoded
+      wa_csv_output-f125 = wa_vbrk-waerk. "'USD'. " Hardcoded
+
+      IF wa_vbrk-mwsbp IS INITIAL.
+        wa_csv_output-f131 = 'U'.
+      ELSE.
+        wa_csv_output-f131 = 'S'.
+      ENDIF.                      "if tax, then s, else U.
+
+      PERFORM append_001.
+
+*--Start of record 002----*
+
+      PERFORM fill_002_defaults.
+
+      wa_csv_output-f143 = wa_csv_output-f9.  "'001TR'.
+      wa_csv_output-f145 = wa_csv_output-f96.               " '00001'.
+
+      MOVE wa_csv_output-f102 TO wa_csv_output-f154. " from record 001
+      wa_csv_output-f155 = wa_csv_output-f103.  " '00000000000000500'.
+
+      PERFORM append_002.
+
+    ENDIF.
+*-- Start  of record 777----*
+    AT LAST.
+      wa_csv_output-f192 = lv_inv_count.
+      lv_inv_total = lv_inv_total * 100.
+      MOVE lv_inv_total TO wa_csv_output-f194.
+      PERFORM fill_777.
+    ENDAT.
+
+    APPEND  wa_csv_output TO gt_csv_output.
+
+    CLEAR wa_output.
+    CLEAR wa_vbrk.
+  ENDLOOP.
+
+**-- Preparing ALV output data
+
+  CLEAR:wa_csv_output,wa_alv_output.
+  REFRESH gt_alv_output.
+
+  LOOP AT gt_csv_output INTO wa_csv_output.
+    MOVE-CORRESPONDING wa_csv_output TO wa_alv_output.
+    APPEND wa_alv_output TO gt_alv_output.
+    CLEAR:wa_alv_output,wa_csv_output.
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_DATA
